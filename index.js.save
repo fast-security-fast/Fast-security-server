@@ -1,0 +1,24 @@
+const express = require("express");
+const app = express();
+
+app.use(express.json());
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    app: "Fast Security",
+    status: "server running"
+  });
+});
+
+app.post("/sos", (req, res) => {
+  console.log("🚨 SOS RECEIVED:", req.body);
+  res.json({
+    ok: true,
+    message: "SOS received",
+    });
+
+const PORT = 3000;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Fast Security server running on http://0.0.0.0:${PORT}`);
+});

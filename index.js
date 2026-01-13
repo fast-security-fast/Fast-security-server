@@ -1,41 +1,36 @@
 const express = require("express");
 const app = express();
 
+// Render/Proxy friendly
+app.set("trust proxy", 1);
+
+// Body JSON
 app.use(express.json());
 
 // Home
 app.get("/", (req, res) => {
-  res.status(200).send("Fast Security server OK");
+  res.status(200).send("OK");
 });
 
-// ✅ SOS - GET (test rapido)
-app.get("/sos", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    method: "GET",
-    message: "SOS ricevuto (GET)",
-    at: new Date().toISOString(),
-  });
+// Health
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
 });
 
-// ✅ SOS - POST (per GPS / payload)
+// SOS (POST)
 app.post("/sos", (req, res) => {
+  const { deviceId, lat, lon, accuracy, timestamp } = req.body || {};
+  console.log("SOS ricevuto:", { deviceId, lat, lon, accuracy, timestamp });
+
   res.status(200).json({
     ok: true,
-    method: "POST",
-    message: "SOS ricevuto (POST)",
-    at: new Date().toISOString(),
-    body: req.body ?? null,
+    message: "SOS ricevuto",
+    received: { deviceId, lat, lon, accuracy, timestamp },
   });
 });
 
-// 404 fallback (così vedi subito se sbagli endpoint)
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Not Found", path: req.path });
-});
-
-// Avvio server (0.0.0.0 = accessibile anche da altri dispositivi in LAN)
-const PORT = 3000;
+// Render uses process.env.PORT
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Fast Security server avviato su http://127.0.0.1:${PORT}`);
+  console.log("Server running on port " + PORT);
 });

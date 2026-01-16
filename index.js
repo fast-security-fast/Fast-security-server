@@ -1,36 +1,25 @@
 const express = require("express");
 const app = express();
 
-// Render/Proxy friendly
-app.set("trust proxy", 1);
-
-// Body JSON
+// Middleware per JSON
 app.use(express.json());
 
-// Home
+// Porta (Render usa process.env.PORT)
+const PORT = process.env.PORT || 3000;
+
+// Endpoint root
 app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// Health
-app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true });
+// Endpoint SOS
+app.get("/sos", (req, res) => {
+  console.log("SOS ricevuto");
+  res.status(200).send("OK");
 });
 
-// SOS (POST)
-app.post("/sos", (req, res) => {
-  const { deviceId, lat, lon, accuracy, timestamp } = req.body || {};
-  console.log("SOS ricevuto:", { deviceId, lat, lon, accuracy, timestamp });
-
-  res.status(200).json({
-    ok: true,
-    message: "SOS ricevuto",
-    received: { deviceId, lat, lon, accuracy, timestamp },
-  });
+// Avvio server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
 
-// Render uses process.env.PORT
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Server running on port " + PORT);
-});

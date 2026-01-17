@@ -1,25 +1,48 @@
 const express = require("express");
 const app = express();
 
-// Middleware per JSON
 app.use(express.json());
 
-// Porta (Render usa process.env.PORT)
 const PORT = process.env.PORT || 3000;
 
-// Endpoint root
+function checkToken(req, res) {
+  const token = req.header("X-SOS-TOKEN");
+  if (!process.env.SOS_TOKEN) {
+    res.status(500).json({ ok: false, error: "SOS_TOKEN non configurato sul server" });
+    return false;
+  }
+  if (token !== process.env.SOS_TOKEN) {
+    res.status(401).json({ ok: false, error: "Unauthorized" });
+    return false;
+  }
+  return true;
+}
+
 app.get("/", (req, res) => {
-  res.status(200).send("OK");
+  res.json({ ok: true, message: "Fast Security server online" });
 });
 
-// Endpoint SOS
+// GET (compatibilità)
 app.get("/sos", (req, res) => {
-  console.log("SOS ricevuto");
-  res.status(200).send("OK");
+  if (!checkToken(req, res)) return;
+  console.log("🚨 SOS GET ricevuto");
+  res.json({ ok: true, message: "SOS ricevuto (GET)" });
 });
 
-// Avvio server
+// POST (nuovo)
+app.post("/sos", (req, res) => {
+  if (!checkToken(req, res)) return;
+
+  const { lat, lon, timestamp } = req.body || {};
+  console.log("🚨 SOS POST ricevuto:", { lat, lon, timestamp });
+
+  res.json({
+    ok: true,
+    message: "SOS ricevuto (POST)",
+    received: { lat, lon, timestamp }
+  });
+});
+
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server Fast Security attivo sulla porta ${PORT}`);
 });
-

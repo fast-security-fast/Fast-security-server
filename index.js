@@ -28,6 +28,29 @@ app.get("/sos", (req, res) => {
   console.log("🚨 SOS GET ricevuto");
   res.json({ ok: true, message: "SOS ricevuto (GET)" });
 });
+// POST (nuovo – V3 Pro)
+app.post("/sos", (req, res) => {
+  if (!checkToken(req, res)) return;
+
+  const { lat, lon, accuracy, timestamp } = req.body || {};
+
+  if (typeof lat !== "number" || typeof lon !== "number") {
+    return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
+  }
+
+  console.log("🚨 SOS POST received:", {
+    lat,
+    lon,
+    accuracy,
+    timestamp
+  });
+
+  res.json({
+    ok: true,
+    message: "SOS received (POST)",
+    received: { lat, lon, accuracy, timestamp }
+  });
+});
 
 // POST (nuovo)
 app.post("/sos", (req, res) => {

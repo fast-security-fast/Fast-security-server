@@ -5,67 +5,116 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+/**
+ * 🔐 Verifica token SOS
+ */
 function checkToken(req, res) {
   const token = req.header("X-SOS-TOKEN");
+
   if (!process.env.SOS_TOKEN) {
-    res.status(500).json({ ok: false, error: "SOS_TOKEN non configurato sul server" });
+    res.status(500).json({
+      ok: false,
+      error: "SOS_TOKEN non configurato sul server"
+    });
     return false;
   }
+
   if (token !== process.env.SOS_TOKEN) {
-    res.status(401).json({ ok: false, error: "Unauthorized" });
+    res.status(401).json({
+      ok: false,
+      error: "Non autorizzato"
+    });
     return false;
   }
+
   return true;
 }
 
+/**
+ * ✅ Root
+ */
 app.get("/", (req, res) => {
-  res.json({ ok: true, message: "Fast Security server online" });
+  res.json({
+    ok: true,
+    message: "Fast Security server online 🚀"
+  });
 });
 
-// GET (compatibilità)
+/**
+ * 🚨 SOS GET (compatibilità / test browser)
+ */
 app.get("/sos", (req, res) => {
   if (!checkToken(req, res)) return;
+
   console.log("🚨 SOS GET ricevuto");
-  res.json({ ok: true, message: "SOS ricevuto (GET)" });
+
+  res.json({
+    ok: true,
+    message: "SOS ricevuto (GET)"
+  });
 });
-// POST (nuovo – V3 Pro)
+
+/**
+ * 🚨 SOS POST (ufficiale – APP)
+ */
 app.post("/sos", (req, res) => {
   if (!checkToken(req, res)) return;
 
-  const { lat, lon, accuracy, timestamp } = req.body || {};
+  const { lat, lon, accuracy, speed, timestamp, mode } = req.body || {};
 
   if (typeof lat !== "number" || typeof lon !== "number") {
-    return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
+    return res.status(400).json({
+      ok: false,
+      error: "Latitudine o longitudine non valide"
+    });
   }
 
-  console.log("🚨 SOS POST received:", {
+  console.log("🚨 SOS POST ricevuto:", {
     lat,
     lon,
     accuracy,
-    timestamp
+    speed,
+    timestamp,
+    mode
   });
+
+  // 🔜 QUI in futuro:
+  // - invio a contatti
+  // - salvataggio DB
+  // - push / WebSocket
+  // - attivazione streaming
 
   res.json({
     ok: true,
-    message: "SOS received (POST)",
-    received: { lat, lon, accuracy, timestamp }
+    message: "SOS ricevuto correttamente",
+    received: {
+      lat,
+      lon,
+      accuracy,
+      speed,
+      timestamp,
+      mode
+    }
   });
 });
 
-// POST (nuovo)
-app.post("/sos", (req, res) => {
+/**
+ * 🎙️ LIVE AUDIO (placeholder – prossimo step)
+ */
+app.post("/live/audio/start", (req, res) => {
   if (!checkToken(req, res)) return;
 
-  const { lat, lon, timestamp } = req.body || {};
-  console.log("🚨 SOS POST ricevuto:", { lat, lon, timestamp });
+  console.log("🎙️ Richiesta avvio audio live");
 
   res.json({
     ok: true,
-    message: "SOS ricevuto (POST)",
-    received: { lat, lon, timestamp }
+    message: "Audio live start (placeholder)"
   });
 });
 
+/**
+ * 🚀 Avvio server
+ */
 app.listen(PORT, () => {
-  console.log(`🚀 Server Fast Security attivo sulla porta ${PORT}`);
+  console.log(`🚀 Fast Security server attivo sulla porta ${PORT}`);
 });

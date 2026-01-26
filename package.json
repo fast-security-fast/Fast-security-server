@@ -1,14 +1,16 @@
 {
-  "name": "fast-security",
+  "name": "fast-security-server",
   "version": "1.0.0",
-  "description": "Fast Security server",
+  "description": "Fast Security backend server",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "express": "^5.2.1",
-    "cors": "^2.8.5"
+    "express": "^4.19.2",
+    "ws": "^8.16.0"
   }
 }

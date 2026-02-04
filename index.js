@@ -2,7 +2,6 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
-
 require("dotenv").config();
 
 const app = express();
@@ -12,7 +11,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 /**
- * TOKEN CHECK
+ * TOKEN CHECK (HTTP)
  * Header: X-SOS-TOKEN
  */
 function checkToken(req, res) {
@@ -29,6 +28,9 @@ function checkToken(req, res) {
   }
   return true;
 }
+
+// ✅ health (Render)
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/", (req, res) => {
   res.json({ ok: true, message: "Fast Security server online" });
@@ -51,18 +53,8 @@ app.post("/sos", (req, res) => {
   if (!checkToken(req, res)) return;
 
   const body = req.body || {};
-  const {
-    lat,
-    lon,
-    accuracy,
-    timestamp,
-    mode,
-    battery,
-    speedKmh,
-    incident
-  } = body;
+  const { lat, lon, accuracy, timestamp, mode, battery, speedKmh, incident } = body;
 
-  // lat/lon possono essere null in casi particolari, ma qui li gestiamo:
   if (typeof lat !== "number" || typeof lon !== "number") {
     return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
   }
@@ -75,7 +67,7 @@ app.post("/sos", (req, res) => {
     mode,
     battery,
     speedKmh,
-    incident
+    incident,
   });
 
   res.json({
@@ -89,8 +81,8 @@ app.post("/sos", (req, res) => {
       mode: mode ?? "UNKNOWN",
       battery: battery ?? null,
       speedKmh: speedKmh ?? null,
-      incident: incident ?? null
-    }
+      incident: incident ?? null,
+    },
   });
 });
 
@@ -99,23 +91,29 @@ app.post("/sos", (req, res) => {
  * Endpoint: /ws
  *
  * Messaggi JSON:
- * 1) join:   { "type":"join", "room":"abc", "peerId":"p1" }
+ * 1) join:   { "type":"join", "room":"abc", "peerId":"p1", "token":"..."? }
  * 2) offer:  { "type":"offer", "room":"abc", "from":"p1", "to":"p2", "sdp":{...} }
  * 3) answer: { "type":"answer","room":"abc", "from":"p2", "to":"p1", "sdp":{...} }
  * 4) ice:    { "type":"ice",   "room":"abc", "from":"p1", "to":"p2", "candidate":{...} }
  * 5) leave:  { "type":"leave", "room":"abc", "peerId":"p1" }
  */
+
+// ✅ server http unico (Render)
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, path: "/ws" });
+
+// ✅ WS server
+const wss = new WebSocket.Server({
+  server,
+  path: "/ws",
+  maxPayload: 1024 * 1024, // 1MB (SDP/ICE stanno larghi)
+});
 
 // rooms: Map<room, Map<peerId, ws>>
 const rooms = new Map();
 
 function safeSend(ws, obj) {
   try {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(obj));
-    }
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   } catch (_) {}
 }
 
@@ -128,7 +126,6 @@ function roomPeers(room) {
 function removePeer(room, peerId) {
   const m = rooms.get(room);
   if (!m) return;
-
   m.delete(peerId);
   if (m.size === 0) rooms.delete(room);
 }
@@ -136,24 +133,40 @@ function removePeer(room, peerId) {
 function broadcastToRoom(room, obj, exceptPeerId = null) {
   const m = rooms.get(room);
   if (!m) return;
-
   for (const [pid, ws] of m.entries()) {
     if (exceptPeerId && pid === exceptPeerId) continue;
     safeSend(ws, obj);
   }
 }
 
-wss.on("connection", (ws) => {
+// ✅ opzionale: token anche su WS (consigliatissimo)
+const WS_TOKEN = process.env.WS_TOKEN || null;
+
+function wsAuthorized(msg) {
+  // Se WS_TOKEN non impostato → non blocco (dev)
+  if (!WS_TOKEN) return true;
+  return msg && msg.token === WS_TOKEN;
+}
+
+// ✅ keep-alive ping/pong (Render)
+function heartbeat() {
+  this.isAlive = true;
+}
+
+wss.on("connection", (ws, req) => {
   ws._peerId = null;
   ws._room = null;
 
-  safeSend(ws, { type: "hello", ok: true, message: "ws connected" });
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
+
+  safeSend(ws, { type: "hello", ok: true, message: "ws connected", path: "/ws" });
 
   ws.on("message", (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
-    } catch (e) {
+    } catch {
       return safeSend(ws, { type: "error", error: "invalid_json" });
     }
 
@@ -161,26 +174,42 @@ wss.on("connection", (ws) => {
 
     // JOIN
     if (type === "join") {
+      if (!wsAuthorized(msg)) {
+        safeSend(ws, { type: "error", error: "unauthorized_ws" });
+        try { ws.close(1008, "Unauthorized"); } catch (_) {}
+        return;
+      }
+
       const room = String(msg.room || "").trim();
       const peerId = String(msg.peerId || "").trim();
       if (!room || !peerId) {
         return safeSend(ws, { type: "error", error: "missing_room_or_peerId" });
       }
 
-      // salva
       ws._room = room;
       ws._peerId = peerId;
 
       if (!rooms.has(room)) rooms.set(room, new Map());
       const peers = rooms.get(room);
 
-      // se peerId già esiste, rimpiazza
+      // ✅ se peerId già connesso (reconnect) chiudo il vecchio socket
+      const old = peers.get(peerId);
+      if (old && old !== ws) {
+        try { safeSend(old, { type: "bye", reason: "replaced_by_new_connection" }); } catch (_) {}
+        try { old.close(1000, "Replaced"); } catch (_) {}
+      }
+
       peers.set(peerId, ws);
 
-      // invia lista peer al nuovo
-      safeSend(ws, { type: "joined", room, peerId, peers: roomPeers(room).filter(p => p !== peerId) });
+      // invia peer list al nuovo
+      safeSend(ws, {
+        type: "joined",
+        room,
+        peerId,
+        peers: roomPeers(room).filter((p) => p !== peerId),
+      });
 
-      // avvisa gli altri che è entrato
+      // avvisa altri
       broadcastToRoom(room, { type: "peer-joined", room, peerId }, peerId);
       return;
     }
@@ -189,16 +218,18 @@ wss.on("connection", (ws) => {
     if (type === "leave") {
       const room = ws._room || msg.room;
       const peerId = ws._peerId || msg.peerId;
+
       if (room && peerId) {
         removePeer(room, peerId);
         broadcastToRoom(room, { type: "peer-left", room, peerId }, peerId);
       }
+
       ws._room = null;
       ws._peerId = null;
       return safeSend(ws, { type: "left", ok: true });
     }
 
-    // OFFER / ANSWER / ICE -> forward al destinatario
+    // OFFER / ANSWER / ICE -> forward
     if (type === "offer" || type === "answer" || type === "ice") {
       const room = String(msg.room || ws._room || "").trim();
       const to = String(msg.to || "").trim();
@@ -214,13 +245,12 @@ wss.on("connection", (ws) => {
         return safeSend(ws, { type: "error", error: "target_not_found", to });
       }
 
-      // inoltra ESATTAMENTE il messaggio (ma garantiamo room/from/to)
+      // inoltra garantendo campi base
       const payload = { ...msg, room, from, to };
       safeSend(target, payload);
       return;
     }
 
-    // fallback
     safeSend(ws, { type: "error", error: "unknown_type" });
   });
 
@@ -234,8 +264,23 @@ wss.on("connection", (ws) => {
   });
 });
 
+// ✅ ping interval (Render)
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch (_) {}
+      return;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (_) {}
+  });
+}, 30000);
+
+wss.on("close", () => clearInterval(pingInterval));
+
 server.listen(PORT, () => {
   console.log(`🚀 Server Fast Security attivo sulla porta ${PORT}`);
-  console.log(`✅ HTTP: /  /sos (GET+POST)`);
+  console.log(`✅ HTTP: /  /health  /sos (GET+POST)`);
   console.log(`✅ WS: /ws`);
+  console.log(`✅ WS_TOKEN: ${WS_TOKEN ? "ON" : "OFF (dev)"}`);
 });

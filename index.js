@@ -4,6 +4,22 @@ const http = require("http");
 const WebSocket = require("ws");
 require("dotenv").config();
 
+// ✅ Firebase Admin (FCM + Firestore) — usa GOOGLE_APPLICATION_CREDENTIALS su Render
+let admin = null;
+let db = null;
+try {
+  // Richiede: npm i firebase-admin
+  admin = require("firebase-admin");
+  if (!admin.apps.length) {
+    admin.initializeApp(); // prende /etc/secrets/firebase-sa.json via GOOGLE_APPLICATION_CREDENTIALS
+  }
+  db = admin.firestore();
+  console.log("✅ Firebase Admin inizializzato (Firestore+FCM)");
+} catch (e) {
+  console.warn("⚠️ Firebase Admin NON inizializzato. /event non funzionerà finché non aggiungi firebase-admin e credenziali.");
+  console.warn("Dettaglio:", e?.message || e);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -46,20 +62,24 @@ app.get("/sos", (req, res) => {
 });
 
 /**
- * POST /sos (V3 Pro)
- * Body: { lat, lon, accuracy?, timestamp?, mode?, battery?, speedKmh?, incident? }
+ * POST /sos (compatibilità V3)
+ * Body: { lat, lon, accuracy?, timestamp?, mode?, battery?, speedKmh?, incident?, victimUid? }
+ *
+ * ✅ Lo lasciamo com'è per compatibilità, ma (se vuoi) puoi iniziare a passare victimUid
+ * e in futuro farlo chiamare internamente /event.
  */
 app.post("/sos", (req, res) => {
   if (!checkToken(req, res)) return;
 
   const body = req.body || {};
-  const { lat, lon, accuracy, timestamp, mode, battery, speedKmh, incident } = body;
+  const { lat, lon, accuracy, timestamp, mode, battery, speedKmh, incident, victimUid } = body;
 
   if (typeof lat !== "number" || typeof lon !== "number") {
     return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
   }
 
   console.log("🚨 SOS POST ricevuto:", {
+    victimUid: victimUid || null,
     lat,
     lon,
     accuracy,
@@ -74,6 +94,7 @@ app.post("/sos", (req, res) => {
     ok: true,
     message: "SOS ricevuto (POST)",
     received: {
+      victimUid: victimUid ?? null,
       lat,
       lon,
       accuracy: accuracy ?? null,
@@ -87,15 +108,208 @@ app.post("/sos", (req, res) => {
 });
 
 /**
+ * ✅ POST /event (NUOVO) — Dispatcher ufficiale
+ * Gestisce: SOS / PROTECT / INCIDENT
+ *
+ * Body minimo:
+ * {
+ *   type: "SOS"|"PROTECT"|"INCIDENT",
+ *   victimUid: "...",
+ *   lat: number,
+ *   lon: number,
+ *   ... extra (accuracy,battery,speedKmh,mode,timestamp,incident)
+ * }
+ */
+app.post("/event", async (req, res) => {
+  if (!checkToken(req, res)) return;
+
+  if (!admin || !db) {
+    return res.status(500).json({
+      ok: false,
+      error: "firebase_admin_not_ready",
+      hint: "Installa firebase-admin e configura GOOGLE_APPLICATION_CREDENTIALS su Render",
+    });
+  }
+
+  try {
+    const body = req.body || {};
+    const type = String(body.type || "").trim().toUpperCase();
+    const victimUid = String(body.victimUid || "").trim();
+    const lat = body.lat;
+    const lon = body.lon;
+
+    if (!["SOS", "PROTECT", "INCIDENT"].includes(type)) {
+      return res.status(400).json({ ok: false, error: "Invalid type (use SOS|PROTECT|INCIDENT)" });
+    }
+    if (!victimUid) {
+      return res.status(400).json({ ok: false, error: "Missing victimUid" });
+    }
+    if (typeof lat !== "number" || typeof lon !== "number") {
+      return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
+    }
+
+    const eventId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const ts = body.timestamp != null ? Number(body.timestamp) : Date.now();
+
+    console.log(`🚨 EVENT ricevuto: ${type}`, { eventId, victimUid, lat, lon });
+
+    // 1) Trusted UIDs
+    const trustedUids = await getTrustedUids(db, victimUid);
+
+    // 2) Tokens dei trusted (multi-device)
+    const tokens = await getTrustedTokens(db, trustedUids);
+
+    // 3) Payload FCM data-only HIGH (fondamentale per non avere "mezza notifica")
+    const dataPayload = toFcmData({
+      type,
+      eventId,
+      victimUid,
+      lat,
+      lon,
+      accuracy: body.accuracy,
+      battery: body.battery,
+      speedKmh: body.speedKmh,
+      mode: body.mode,
+      timestamp: ts,
+      incident: body.incident,
+    });
+
+    // 4) Invio FCM
+    const results = await sendToTokens(admin, tokens, dataPayload);
+
+    // 5) (Consigliato) salva storico evento
+    await db.collection("events").doc(eventId).set({
+      type,
+      eventId,
+      victimUid,
+      lat,
+      lon,
+      accuracy: body.accuracy ?? null,
+      battery: body.battery ?? null,
+      speedKmh: body.speedKmh ?? null,
+      mode: body.mode ?? null,
+      timestamp: ts,
+      incident: body.incident ?? null,
+      trustedUids,
+      tokensCount: tokens.length,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.json({
+      ok: true,
+      eventId,
+      trustedUidsCount: trustedUids.length,
+      tokensCount: tokens.length,
+      fcm: results,
+    });
+  } catch (e) {
+    console.error("❌ POST /event error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* =========================
+   Helpers Firestore + FCM
+   ========================= */
+
+function toFcmData(obj) {
+  // FCM data => SOLO stringhe
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined || v === null) continue;
+    out[k] = String(v);
+  }
+  return out;
+}
+
+async function getTrustedUids(db, victimUid) {
+  // Schema A: users/{victimUid}/trustedContacts/{trustedUid}
+  try {
+    const sub = await db.collection("users").doc(victimUid).collection("trustedContacts").get();
+    if (!sub.empty) return sub.docs.map((d) => d.id);
+  } catch (_) {}
+
+  // Schema B: users/{victimUid}.trustedUids array
+  try {
+    const userDoc = await db.collection("users").doc(victimUid).get();
+    if (userDoc.exists) {
+      const data = userDoc.data() || {};
+      if (Array.isArray(data.trustedUids) && data.trustedUids.length) {
+        return data.trustedUids.map(String);
+      }
+    }
+  } catch (_) {}
+
+  return [];
+}
+
+async function getTrustedTokens(db, trustedUids) {
+  const tokens = [];
+
+  for (const uid of trustedUids) {
+    // Schema A: users/{uid}/fcmTokens/{tokenDoc}  (docId = token o field token)
+    try {
+      const snap = await db.collection("users").doc(uid).collection("fcmTokens").get();
+      if (!snap.empty) {
+        for (const d of snap.docs) {
+          const data = d.data() || {};
+          const t = data.token || d.id;
+          if (t) tokens.push(String(t));
+        }
+        continue;
+      }
+    } catch (_) {}
+
+    // Schema B: users/{uid}.fcmToken singolo o array fcmTokens
+    try {
+      const userDoc = await db.collection("users").doc(uid).get();
+      if (userDoc.exists) {
+        const data = userDoc.data() || {};
+        if (data.fcmToken) tokens.push(String(data.fcmToken));
+        if (Array.isArray(data.fcmTokens)) data.fcmTokens.forEach((t) => tokens.push(String(t)));
+      }
+    } catch (_) {}
+  }
+
+  // dedup + pulizia base
+  return [...new Set(tokens)].filter((t) => typeof t === "string" && t.length > 20);
+}
+
+async function sendToTokens(admin, tokens, data) {
+  if (!tokens.length) return { sent: 0, failures: 0, batches: 0 };
+
+  const BATCH = 500;
+  let sent = 0;
+  let failures = 0;
+  let batches = 0;
+
+  for (let i = 0; i < tokens.length; i += BATCH) {
+    const chunk = tokens.slice(i, i + BATCH);
+    batches++;
+
+    const resp = await admin.messaging().sendEachForMulticast({
+      tokens: chunk,
+      android: { priority: "high" },
+      data, // ✅ data-only: niente notification
+    });
+
+    sent += resp.successCount;
+    failures += resp.failureCount;
+
+    // Log errori (token invalidi ecc.)
+    resp.responses.forEach((r, idx) => {
+      if (!r.success) {
+        console.warn("⚠️ FCM fail token:", chunk[idx], r.error?.message);
+      }
+    });
+  }
+
+  return { sent, failures, batches };
+}
+
+/**
  * ============ WEBSOCKET SIGNALING (WebRTC) ============
  * Endpoint: /ws
- *
- * Messaggi JSON:
- * 1) join:   { "type":"join", "room":"abc", "peerId":"p1", "token":"..."? }
- * 2) offer:  { "type":"offer", "room":"abc", "from":"p1", "to":"p2", "sdp":{...} }
- * 3) answer: { "type":"answer","room":"abc", "from":"p2", "to":"p1", "sdp":{...} }
- * 4) ice:    { "type":"ice",   "room":"abc", "from":"p1", "to":"p2", "candidate":{...} }
- * 5) leave:  { "type":"leave", "room":"abc", "peerId":"p1" }
  */
 
 // ✅ server http unico (Render)
@@ -280,7 +494,7 @@ wss.on("close", () => clearInterval(pingInterval));
 
 server.listen(PORT, () => {
   console.log(`🚀 Server Fast Security attivo sulla porta ${PORT}`);
-  console.log(`✅ HTTP: /  /health  /sos (GET+POST)`);
+  console.log(`✅ HTTP: /  /health  /sos (GET+POST)  /event (POST)`);
   console.log(`✅ WS: /ws`);
   console.log(`✅ WS_TOKEN: ${WS_TOKEN ? "ON" : "OFF (dev)"}`);
 });

@@ -4,22 +4,93 @@ const http = require("http");
 const WebSocket = require("ws");
 require("dotenv").config();
 
-// ✅ Firebase Admin (FCM + Firestore) — usa GOOGLE_APPLICATION_CREDENTIALS su Render
+const fs = require("fs");
+
+// ================================
+// Firebase Admin init (robusto)
+// ================================
 let admin = null;
 let db = null;
-try {
-  // Richiede: npm i firebase-admin
-  admin = require("firebase-admin");
-  if (!admin.apps.length) {
-    admin.initializeApp(); // prende /etc/secrets/firebase-sa.json via GOOGLE_APPLICATION_CREDENTIALS
+
+function initFirebaseAdmin() {
+  try {
+    admin = require("firebase-admin");
+  } catch (e) {
+    console.warn("⚠️ firebase-admin non installato. Esegui: npm i firebase-admin");
+    return { ok: false, reason: "firebase_admin_missing" };
   }
-  db = admin.firestore();
-  console.log("✅ Firebase Admin inizializzato (Firestore+FCM)");
-} catch (e) {
-  console.warn("⚠️ Firebase Admin NON inizializzato. /event non funzionerà finché non aggiungi firebase-admin e credenziali.");
-  console.warn("Dettaglio:", e?.message || e);
+
+  if (admin.apps.length) {
+    db = admin.firestore();
+    return { ok: true, source: "already_initialized" };
+  }
+
+  // 1) ENV: FIREBASE_SA_JSON (JSON completo del service account)
+  if (process.env.FIREBASE_SA_JSON) {
+    try {
+      const credObj = JSON.parse(process.env.FIREBASE_SA_JSON);
+      admin.initializeApp({ credential: admin.credential.cert(credObj) });
+      db = admin.firestore();
+      return { ok: true, source: "FIREBASE_SA_JSON" };
+    } catch (e) {
+      console.error("❌ FIREBASE_SA_JSON non valido:", e?.message || e);
+      return { ok: false, reason: "firebase_sa_json_invalid" };
+    }
+  }
+
+  // 2) ENV: FIREBASE_SA_B64 (base64 del JSON)
+  if (process.env.FIREBASE_SA_B64) {
+    try {
+      const raw = Buffer.from(process.env.FIREBASE_SA_B64, "base64").toString("utf8");
+      const credObj = JSON.parse(raw);
+      admin.initializeApp({ credential: admin.credential.cert(credObj) });
+      db = admin.firestore();
+      return { ok: true, source: "FIREBASE_SA_B64" };
+    } catch (e) {
+      console.error("❌ FIREBASE_SA_B64 non valido:", e?.message || e);
+      return { ok: false, reason: "firebase_sa_b64_invalid" };
+    }
+  }
+
+  // 3) GOOGLE_APPLICATION_CREDENTIALS (di solito Render Secret File)
+  const gac = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (gac) {
+    try {
+      if (!fs.existsSync(gac)) {
+        console.error(`❌ GOOGLE_APPLICATION_CREDENTIALS punta a file mancante: ${gac}`);
+        return { ok: false, reason: "gac_file_missing", path: gac };
+      }
+      admin.initializeApp(); // usa Application Default Credentials
+      db = admin.firestore();
+      return { ok: true, source: `GOOGLE_APPLICATION_CREDENTIALS:${gac}` };
+    } catch (e) {
+      console.error("❌ Errore init con GOOGLE_APPLICATION_CREDENTIALS:", e?.message || e);
+      return { ok: false, reason: "gac_init_error" };
+    }
+  }
+
+  // 4) Ultimo tentativo: ADC senza variabili (raramente funziona su Render)
+  try {
+    admin.initializeApp();
+    db = admin.firestore();
+    return { ok: true, source: "ADC_default" };
+  } catch (e) {
+    console.error("❌ Firebase Admin init fallito (nessuna credenziale disponibile):", e?.message || e);
+    return { ok: false, reason: "no_credentials" };
+  }
 }
 
+const fb = initFirebaseAdmin();
+if (fb.ok) {
+  console.log("✅ Firebase Admin inizializzato (Firestore+FCM) | source:", fb.source);
+} else {
+  console.warn("⚠️ Firebase Admin NON pronto:", fb);
+  console.warn("⚠️ /event risponderà 503 finché non configuri le credenziali.");
+}
+
+// ================================
+// Express
+// ================================
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -34,7 +105,7 @@ function checkToken(req, res) {
   const token = req.header("X-SOS-TOKEN");
 
   if (!process.env.SOS_TOKEN) {
-    res.status(500).json({ ok: false, error: "SOS_TOKEN non configurato sul server" });
+    res.status(500).json({ ok: false, error: "SOS_TOKEN_not_configured" });
     return false;
   }
 
@@ -45,8 +116,8 @@ function checkToken(req, res) {
   return true;
 }
 
-// ✅ health (Render)
-app.get("/health", (req, res) => res.json({ ok: true }));
+// health
+app.get("/health", (req, res) => res.json({ ok: true, firebaseAdmin: !!admin, firestore: !!db }));
 
 app.get("/", (req, res) => {
   res.json({ ok: true, message: "Fast Security server online" });
@@ -63,10 +134,6 @@ app.get("/sos", (req, res) => {
 
 /**
  * POST /sos (compatibilità V3)
- * Body: { lat, lon, accuracy?, timestamp?, mode?, battery?, speedKmh?, incident?, victimUid? }
- *
- * ✅ Lo lasciamo com'è per compatibilità, ma (se vuoi) puoi iniziare a passare victimUid
- * e in futuro farlo chiamare internamente /event.
  */
 app.post("/sos", (req, res) => {
   if (!checkToken(req, res)) return;
@@ -74,6 +141,7 @@ app.post("/sos", (req, res) => {
   const body = req.body || {};
   const { lat, lon, accuracy, timestamp, mode, battery, speedKmh, incident, victimUid } = body;
 
+  // Qui lasciamo rigido lat/lon perché è compatibilità storica
   if (typeof lat !== "number" || typeof lon !== "number") {
     return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
   }
@@ -108,26 +176,17 @@ app.post("/sos", (req, res) => {
 });
 
 /**
- * ✅ POST /event (NUOVO) — Dispatcher ufficiale
- * Gestisce: SOS / PROTECT / INCIDENT
- *
- * Body minimo:
- * {
- *   type: "SOS"|"PROTECT"|"INCIDENT",
- *   victimUid: "...",
- *   lat: number,
- *   lon: number,
- *   ... extra (accuracy,battery,speedKmh,altitude,address,addressOk,heading,mode,timestamp,incident)
- * }
+ * ✅ POST /event (Dispatcher ufficiale)
+ * Accetta anche lat/lon null (es: shareLoc=false o permessi mancanti)
  */
 app.post("/event", async (req, res) => {
   if (!checkToken(req, res)) return;
 
   if (!admin || !db) {
-    return res.status(500).json({
+    return res.status(503).json({
       ok: false,
       error: "firebase_admin_not_ready",
-      hint: "Installa firebase-admin e configura GOOGLE_APPLICATION_CREDENTIALS su Render",
+      hint: "Configura FIREBASE_SA_JSON o FIREBASE_SA_B64 o GOOGLE_APPLICATION_CREDENTIALS (Render Secret File) e redeploy",
     });
   }
 
@@ -135,6 +194,7 @@ app.post("/event", async (req, res) => {
     const body = req.body || {};
     const type = String(body.type || "").trim().toUpperCase();
     const victimUid = String(body.victimUid || "").trim();
+
     const lat = body.lat;
     const lon = body.lon;
 
@@ -144,22 +204,20 @@ app.post("/event", async (req, res) => {
     if (!victimUid) {
       return res.status(400).json({ ok: false, error: "Missing victimUid" });
     }
-    if (typeof lat !== "number" || typeof lon !== "number") {
-      return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
+
+    // ✅ lat/lon possono essere null; se presenti devono essere numeri
+    const latOk = lat == null || typeof lat === "number";
+    const lonOk = lon == null || typeof lon === "number";
+    if (!latOk || !lonOk) {
+      return res.status(400).json({ ok: false, error: "Invalid lat/lon (must be number or null)" });
     }
 
     const eventId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
     const ts = body.timestamp != null ? Number(body.timestamp) : Date.now();
 
-    // extra campi
     const accuracy = body.accuracy != null ? Number(body.accuracy) : null;
     const battery = body.battery != null ? Number(body.battery) : null;
-
     const speedKmh = body.speedKmh != null ? Number(body.speedKmh) : null;
-    if (type === "INCIDENT" && (speedKmh === null || Number.isNaN(speedKmh))) {
-      console.warn("⚠️ INCIDENT ricevuto senza speedKmh (ultima velocità). Evento inviato lo stesso.");
-    }
-
     const altitude = body.altitude != null ? Number(body.altitude) : null;
     const heading = body.heading != null ? Number(body.heading) : null;
 
@@ -169,8 +227,8 @@ app.post("/event", async (req, res) => {
     console.log(`🚨 EVENT ricevuto: ${type}`, {
       eventId,
       victimUid,
-      lat,
-      lon,
+      lat: lat ?? null,
+      lon: lon ?? null,
       mode: body.mode || null,
       accuracy,
       battery,
@@ -185,13 +243,13 @@ app.post("/event", async (req, res) => {
     // 2) Tokens dei trusted (multi-device)
     const tokens = await getTrustedTokens(db, trustedUids);
 
-    // 3) Payload FCM data-only HIGH (fondamentale per non avere "mezza notifica")
+    // 3) Payload data-only
     const dataPayload = toFcmData({
       type,
       eventId,
       victimUid,
-      lat,
-      lon,
+      lat: lat ?? null,
+      lon: lon ?? null,
       accuracy,
       battery,
       speedKmh,
@@ -207,13 +265,13 @@ app.post("/event", async (req, res) => {
     // 4) Invio FCM
     const results = await sendToTokens(admin, tokens, dataPayload);
 
-    // 5) salva storico evento
+    // 5) Storico evento
     await db.collection("events").doc(eventId).set({
       type,
       eventId,
       victimUid,
-      lat,
-      lon,
+      lat: lat ?? null,
+      lon: lon ?? null,
       accuracy,
       battery,
       speedKmh,
@@ -258,7 +316,6 @@ function normalizeBool(v) {
 }
 
 function toFcmData(obj) {
-  // FCM data => SOLO stringhe
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
     if (v === undefined || v === null) continue;
@@ -268,13 +325,11 @@ function toFcmData(obj) {
 }
 
 async function getTrustedUids(db, victimUid) {
-  // Schema A: users/{victimUid}/trustedContacts/{trustedUid}
   try {
     const sub = await db.collection("users").doc(victimUid).collection("trustedContacts").get();
     if (!sub.empty) return sub.docs.map((d) => d.id);
   } catch (_) {}
 
-  // Schema B: users/{victimUid}.trustedUids array
   try {
     const userDoc = await db.collection("users").doc(victimUid).get();
     if (userDoc.exists) {
@@ -292,7 +347,6 @@ async function getTrustedTokens(db, trustedUids) {
   const tokens = [];
 
   for (const uid of trustedUids) {
-    // Schema A: users/{uid}/fcmTokens/{tokenDoc}  (docId = token o field token)
     try {
       const snap = await db.collection("users").doc(uid).collection("fcmTokens").get();
       if (!snap.empty) {
@@ -305,7 +359,6 @@ async function getTrustedTokens(db, trustedUids) {
       }
     } catch (_) {}
 
-    // Schema B: users/{uid}.fcmToken singolo o array fcmTokens
     try {
       const userDoc = await db.collection("users").doc(uid).get();
       if (userDoc.exists) {
@@ -316,7 +369,6 @@ async function getTrustedTokens(db, trustedUids) {
     } catch (_) {}
   }
 
-  // dedup + pulizia base
   return [...new Set(tokens)].filter((t) => typeof t === "string" && t.length > 20);
 }
 
@@ -335,17 +387,14 @@ async function sendToTokens(admin, tokens, data) {
     const resp = await admin.messaging().sendEachForMulticast({
       tokens: chunk,
       android: { priority: "high" },
-      data, // ✅ data-only: niente notification
+      data,
     });
 
     sent += resp.successCount;
     failures += resp.failureCount;
 
-    // Log errori (token invalidi ecc.)
     resp.responses.forEach((r, idx) => {
-      if (!r.success) {
-        console.warn("⚠️ FCM fail token:", chunk[idx], r.error?.message);
-      }
+      if (!r.success) console.warn("⚠️ FCM fail token:", chunk[idx], r.error?.message);
     });
   }
 
@@ -353,21 +402,16 @@ async function sendToTokens(admin, tokens, data) {
 }
 
 /**
- * ============ WEBSOCKET SIGNALING (WebRTC) ============
- * Endpoint: /ws
+ * ============ WEBSOCKET SIGNALING ============
  */
-
-// ✅ server http unico (Render)
 const server = http.createServer(app);
 
-// ✅ WS server
 const wss = new WebSocket.Server({
   server,
   path: "/ws",
-  maxPayload: 1024 * 1024, // 1MB (SDP/ICE stanno larghi)
+  maxPayload: 1024 * 1024,
 });
 
-// rooms: Map<room, Map<peerId, ws>>
 const rooms = new Map();
 
 function safeSend(ws, obj) {
@@ -398,21 +442,18 @@ function broadcastToRoom(room, obj, exceptPeerId = null) {
   }
 }
 
-// ✅ opzionale: token anche su WS (consigliatissimo)
 const WS_TOKEN = process.env.WS_TOKEN || null;
 
 function wsAuthorized(msg) {
-  // Se WS_TOKEN non impostato → non blocco (dev)
   if (!WS_TOKEN) return true;
   return msg && msg.token === WS_TOKEN;
 }
 
-// ✅ keep-alive ping/pong (Render)
 function heartbeat() {
   this.isAlive = true;
 }
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   ws._peerId = null;
   ws._room = null;
 
@@ -431,7 +472,6 @@ wss.on("connection", (ws, req) => {
 
     const type = msg.type;
 
-    // JOIN
     if (type === "join") {
       if (!wsAuthorized(msg)) {
         safeSend(ws, { type: "error", error: "unauthorized_ws" });
@@ -451,7 +491,6 @@ wss.on("connection", (ws, req) => {
       if (!rooms.has(room)) rooms.set(room, new Map());
       const peers = rooms.get(room);
 
-      // ✅ se peerId già connesso (reconnect) chiudo il vecchio socket
       const old = peers.get(peerId);
       if (old && old !== ws) {
         try { safeSend(old, { type: "bye", reason: "replaced_by_new_connection" }); } catch (_) {}
@@ -460,7 +499,6 @@ wss.on("connection", (ws, req) => {
 
       peers.set(peerId, ws);
 
-      // invia peer list al nuovo
       safeSend(ws, {
         type: "joined",
         room,
@@ -468,12 +506,10 @@ wss.on("connection", (ws, req) => {
         peers: roomPeers(room).filter((p) => p !== peerId),
       });
 
-      // avvisa altri
       broadcastToRoom(room, { type: "peer-joined", room, peerId }, peerId);
       return;
     }
 
-    // LEAVE
     if (type === "leave") {
       const room = ws._room || msg.room;
       const peerId = ws._peerId || msg.peerId;
@@ -488,7 +524,6 @@ wss.on("connection", (ws, req) => {
       return safeSend(ws, { type: "left", ok: true });
     }
 
-    // OFFER / ANSWER / ICE -> forward
     if (type === "offer" || type === "answer" || type === "ice") {
       const room = String(msg.room || ws._room || "").trim();
       const to = String(msg.to || "").trim();
@@ -504,7 +539,6 @@ wss.on("connection", (ws, req) => {
         return safeSend(ws, { type: "error", error: "target_not_found", to });
       }
 
-      // inoltra garantendo campi base
       const payload = { ...msg, room, from, to };
       safeSend(target, payload);
       return;
@@ -523,7 +557,6 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-// ✅ ping interval (Render)
 const pingInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {

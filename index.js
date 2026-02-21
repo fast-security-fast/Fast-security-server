@@ -9,20 +9,21 @@ const fs = require("fs");
 // ================================
 // Firebase Admin init (robusto)
 // ================================
-// ✅ Firebase Admin (FCM + Firestore)
 let admin = null;
 let db = null;
 
 function initFirebaseAdmin() {
   try {
     admin = require("firebase-admin");
+
+    // già inizializzato (hot reload / reuse)
     if (admin.apps.length) {
       db = admin.firestore();
       console.log("✅ Firebase Admin già inizializzato");
-      return true;
+      return { ok: true, source: "already_initialized" };
     }
 
-    // 1) Caso ENV JSON
+    // 1) ENV JSON completo
     const saJson = process.env.FIREBASE_SA_JSON;
     if (saJson && saJson.trim().startsWith("{")) {
       const serviceAccount = JSON.parse(saJson);
@@ -31,93 +32,34 @@ function initFirebaseAdmin() {
       });
       db = admin.firestore();
       console.log("✅ Firebase Admin init da FIREBASE_SA_JSON");
-      return true;
+      return { ok: true, source: "FIREBASE_SA_JSON" };
     }
 
-    // 2) Caso Secret File / file path
+    // 2) File path (Render Secret File)
     const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
     if (credPath) {
-      // initializeApp() userà GOOGLE_APPLICATION_CREDENTIALS
-      admin.initializeApp();
+      if (!fs.existsSync(credPath)) {
+        console.error(`❌ GOOGLE_APPLICATION_CREDENTIALS punta a file mancante: ${credPath}`);
+        return { ok: false, reason: "gac_file_missing", path: credPath };
+      }
+      admin.initializeApp(); // usa GOOGLE_APPLICATION_CREDENTIALS
       db = admin.firestore();
       console.log("✅ Firebase Admin init da GOOGLE_APPLICATION_CREDENTIALS =", credPath);
-      return true;
+      return { ok: true, source: `GOOGLE_APPLICATION_CREDENTIALS:${credPath}` };
     }
 
-    // 3) Niente configurato
     console.warn("⚠️ Firebase Admin NON pronto: manca FIREBASE_SA_JSON o GOOGLE_APPLICATION_CREDENTIALS");
-    return false;
-
+    return { ok: false, reason: "no_credentials" };
   } catch (e) {
     console.error("❌ Firebase Admin init error:", e?.message || e);
-    return false;
+    return { ok: false, reason: "init_exception" };
   }
 }
 
-const firebaseReady = initFirebaseAdmin();
-
-  if (admin.apps.length) {
-    db = admin.firestore();
-    return { ok: true, source: "already_initialized" };
-  }
-
-  // 1) ENV: FIREBASE_SA_JSON (JSON completo del service account)
-  if (process.env.FIREBASE_SA_JSON) {
-    try {
-      const credObj = JSON.parse(process.env.FIREBASE_SA_JSON);
-      admin.initializeApp({ credential: admin.credential.cert(credObj) });
-      db = admin.firestore();
-      return { ok: true, source: "FIREBASE_SA_JSON" };
-    } catch (e) {
-      console.error("❌ FIREBASE_SA_JSON non valido:", e?.message || e);
-      return { ok: false, reason: "firebase_sa_json_invalid" };
-    }
-  }
-
-  // 2) ENV: FIREBASE_SA_B64 (base64 del JSON)
-  if (process.env.FIREBASE_SA_B64) {
-    try {
-      const raw = Buffer.from(process.env.FIREBASE_SA_B64, "base64").toString("utf8");
-      const credObj = JSON.parse(raw);
-      admin.initializeApp({ credential: admin.credential.cert(credObj) });
-      db = admin.firestore();
-      return { ok: true, source: "FIREBASE_SA_B64" };
-    } catch (e) {
-      console.error("❌ FIREBASE_SA_B64 non valido:", e?.message || e);
-      return { ok: false, reason: "firebase_sa_b64_invalid" };
-    }
-  }
-
-  // 3) GOOGLE_APPLICATION_CREDENTIALS (di solito Render Secret File)
-  const gac = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (gac) {
-    try {
-      if (!fs.existsSync(gac)) {
-        console.error(`❌ GOOGLE_APPLICATION_CREDENTIALS punta a file mancante: ${gac}`);
-        return { ok: false, reason: "gac_file_missing", path: gac };
-      }
-      admin.initializeApp(); // usa Application Default Credentials
-      db = admin.firestore();
-      return { ok: true, source: `GOOGLE_APPLICATION_CREDENTIALS:${gac}` };
-    } catch (e) {
-      console.error("❌ Errore init con GOOGLE_APPLICATION_CREDENTIALS:", e?.message || e);
-      return { ok: false, reason: "gac_init_error" };
-    }
-  }
-
-  // 4) Ultimo tentativo: ADC senza variabili (raramente funziona su Render)
-  try {
-    admin.initializeApp();
-    db = admin.firestore();
-    return { ok: true, source: "ADC_default" };
-  } catch (e) {
-    console.error("❌ Firebase Admin init fallito (nessuna credenziale disponibile):", e?.message || e);
-    return { ok: false, reason: "no_credentials" };
-  }
-
-
 const fb = initFirebaseAdmin();
-if (fb.ok) {
+const firebaseReady = fb.ok;
+
+if (firebaseReady) {
   console.log("✅ Firebase Admin inizializzato (Firestore+FCM) | source:", fb.source);
 } else {
   console.warn("⚠️ Firebase Admin NON pronto:", fb);
@@ -152,7 +94,7 @@ function checkToken(req, res) {
   return true;
 }
 
-// health
+// ✅ debug (chiuso correttamente)
 app.get("/debug/firebase", (req, res) => {
   res.json({
     ok: true,
@@ -163,8 +105,11 @@ app.get("/debug/firebase", (req, res) => {
     GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS || null,
     SOS_TOKEN_set: !!process.env.SOS_TOKEN,
   });
+});
 
-app.get("/health", (req, res) => res.json({ ok: true, firebaseAdmin: !!admin, firestore: !!db }));
+app.get("/health", (req, res) =>
+  res.json({ ok: true, firebaseAdmin: !!admin, firestore: !!db })
+);
 
 app.get("/", (req, res) => {
   res.json({ ok: true, message: "Fast Security server online" });
@@ -188,7 +133,6 @@ app.post("/sos", (req, res) => {
   const body = req.body || {};
   const { lat, lon, accuracy, timestamp, mode, battery, speedKmh, incident, victimUid } = body;
 
-  // Qui lasciamo rigido lat/lon perché è compatibilità storica
   if (typeof lat !== "number" || typeof lon !== "number") {
     return res.status(400).json({ ok: false, error: "Invalid lat/lon" });
   }
@@ -224,7 +168,7 @@ app.post("/sos", (req, res) => {
 
 /**
  * ✅ POST /event (Dispatcher ufficiale)
- * Accetta anche lat/lon null (es: shareLoc=false o permessi mancanti)
+ * Accetta lat/lon null (se shareLoc=false), ma se presenti devono essere number
  */
 app.post("/event", async (req, res) => {
   if (!checkToken(req, res)) return;
@@ -233,7 +177,8 @@ app.post("/event", async (req, res) => {
     return res.status(503).json({
       ok: false,
       error: "firebase_admin_not_ready",
-      hint: "Configura FIREBASE_SA_JSON o FIREBASE_SA_B64 o GOOGLE_APPLICATION_CREDENTIALS (Render Secret File) e redeploy",
+      hint:
+        "Configura FIREBASE_SA_JSON (ENV) oppure GOOGLE_APPLICATION_CREDENTIALS (Render Secret File) e redeploy",
     });
   }
 
@@ -252,7 +197,6 @@ app.post("/event", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing victimUid" });
     }
 
-    // ✅ lat/lon possono essere null; se presenti devono essere numeri
     const latOk = lat == null || typeof lat === "number";
     const lonOk = lon == null || typeof lon === "number";
     if (!latOk || !lonOk) {
@@ -284,13 +228,9 @@ app.post("/event", async (req, res) => {
       addressOk,
     });
 
-    // 1) Trusted UIDs
     const trustedUids = await getTrustedUids(db, victimUid);
-
-    // 2) Tokens dei trusted (multi-device)
     const tokens = await getTrustedTokens(db, trustedUids);
 
-    // 3) Payload data-only
     const dataPayload = toFcmData({
       type,
       eventId,
@@ -309,10 +249,8 @@ app.post("/event", async (req, res) => {
       incident: body.incident,
     });
 
-    // 4) Invio FCM
     const results = await sendToTokens(admin, tokens, dataPayload);
 
-    // 5) Storico evento
     await db.collection("events").doc(eventId).set({
       type,
       eventId,
@@ -372,11 +310,13 @@ function toFcmData(obj) {
 }
 
 async function getTrustedUids(db, victimUid) {
+  // Schema A: users/{victimUid}/trustedContacts/{trustedUid}
   try {
     const sub = await db.collection("users").doc(victimUid).collection("trustedContacts").get();
     if (!sub.empty) return sub.docs.map((d) => d.id);
   } catch (_) {}
 
+  // Schema B: users/{victimUid}.trustedUids array
   try {
     const userDoc = await db.collection("users").doc(victimUid).get();
     if (userDoc.exists) {
@@ -394,6 +334,7 @@ async function getTrustedTokens(db, trustedUids) {
   const tokens = [];
 
   for (const uid of trustedUids) {
+    // Schema A: users/{uid}/fcmTokens/*
     try {
       const snap = await db.collection("users").doc(uid).collection("fcmTokens").get();
       if (!snap.empty) {
@@ -406,6 +347,7 @@ async function getTrustedTokens(db, trustedUids) {
       }
     } catch (_) {}
 
+    // Schema B: users/{uid}.fcmToken o fcmTokens[]
     try {
       const userDoc = await db.collection("users").doc(uid).get();
       if (userDoc.exists) {
@@ -434,7 +376,7 @@ async function sendToTokens(admin, tokens, data) {
     const resp = await admin.messaging().sendEachForMulticast({
       tokens: chunk,
       android: { priority: "high" },
-      data,
+      data, // data-only
     });
 
     sent += resp.successCount;
@@ -604,6 +546,7 @@ wss.on("connection", (ws) => {
   });
 });
 
+// ping keep-alive
 const pingInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {

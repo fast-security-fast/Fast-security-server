@@ -114,7 +114,7 @@ const firebaseReady = initFirebaseAdmin();
     console.error("❌ Firebase Admin init fallito (nessuna credenziale disponibile):", e?.message || e);
     return { ok: false, reason: "no_credentials" };
   }
-}
+
 
 const fb = initFirebaseAdmin();
 if (fb.ok) {

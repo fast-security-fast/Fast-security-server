@@ -9,16 +9,52 @@ const fs = require("fs");
 // ================================
 // Firebase Admin init (robusto)
 // ================================
+// ✅ Firebase Admin (FCM + Firestore)
 let admin = null;
 let db = null;
 
 function initFirebaseAdmin() {
   try {
     admin = require("firebase-admin");
+    if (admin.apps.length) {
+      db = admin.firestore();
+      console.log("✅ Firebase Admin già inizializzato");
+      return true;
+    }
+
+    // 1) Caso ENV JSON
+    const saJson = process.env.FIREBASE_SA_JSON;
+    if (saJson && saJson.trim().startsWith("{")) {
+      const serviceAccount = JSON.parse(saJson);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+      db = admin.firestore();
+      console.log("✅ Firebase Admin init da FIREBASE_SA_JSON");
+      return true;
+    }
+
+    // 2) Caso Secret File / file path
+    const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (credPath) {
+      // initializeApp() userà GOOGLE_APPLICATION_CREDENTIALS
+      admin.initializeApp();
+      db = admin.firestore();
+      console.log("✅ Firebase Admin init da GOOGLE_APPLICATION_CREDENTIALS =", credPath);
+      return true;
+    }
+
+    // 3) Niente configurato
+    console.warn("⚠️ Firebase Admin NON pronto: manca FIREBASE_SA_JSON o GOOGLE_APPLICATION_CREDENTIALS");
+    return false;
+
   } catch (e) {
-    console.warn("⚠️ firebase-admin non installato. Esegui: npm i firebase-admin");
-    return { ok: false, reason: "firebase_admin_missing" };
+    console.error("❌ Firebase Admin init error:", e?.message || e);
+    return false;
   }
+}
+
+const firebaseReady = initFirebaseAdmin();
 
   if (admin.apps.length) {
     db = admin.firestore();
@@ -117,6 +153,17 @@ function checkToken(req, res) {
 }
 
 // health
+app.get("/debug/firebase", (req, res) => {
+  res.json({
+    ok: true,
+    firebaseReady,
+    hasAdmin: !!admin,
+    hasDb: !!db,
+    hasFIREBASE_SA_JSON: !!process.env.FIREBASE_SA_JSON,
+    GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS || null,
+    SOS_TOKEN_set: !!process.env.SOS_TOKEN,
+  });
+
 app.get("/health", (req, res) => res.json({ ok: true, firebaseAdmin: !!admin, firestore: !!db }));
 
 app.get("/", (req, res) => {

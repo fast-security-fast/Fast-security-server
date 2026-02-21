@@ -117,7 +117,7 @@ app.post("/sos", (req, res) => {
  *   victimUid: "...",
  *   lat: number,
  *   lon: number,
- *   ... extra (accuracy,battery,speedKmh,mode,timestamp,incident)
+ *   ... extra (accuracy,battery,speedKmh,altitude,address,addressOk,heading,mode,timestamp,incident)
  * }
  */
 app.post("/event", async (req, res) => {
@@ -151,7 +151,33 @@ app.post("/event", async (req, res) => {
     const eventId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
     const ts = body.timestamp != null ? Number(body.timestamp) : Date.now();
 
-    console.log(`🚨 EVENT ricevuto: ${type}`, { eventId, victimUid, lat, lon });
+    // extra campi
+    const accuracy = body.accuracy != null ? Number(body.accuracy) : null;
+    const battery = body.battery != null ? Number(body.battery) : null;
+
+    const speedKmh = body.speedKmh != null ? Number(body.speedKmh) : null;
+    if (type === "INCIDENT" && (speedKmh === null || Number.isNaN(speedKmh))) {
+      console.warn("⚠️ INCIDENT ricevuto senza speedKmh (ultima velocità). Evento inviato lo stesso.");
+    }
+
+    const altitude = body.altitude != null ? Number(body.altitude) : null;
+    const heading = body.heading != null ? Number(body.heading) : null;
+
+    const address = typeof body.address === "string" ? body.address.trim() : "";
+    const addressOk = normalizeBool(body.addressOk);
+
+    console.log(`🚨 EVENT ricevuto: ${type}`, {
+      eventId,
+      victimUid,
+      lat,
+      lon,
+      mode: body.mode || null,
+      accuracy,
+      battery,
+      speedKmh,
+      altitude,
+      addressOk,
+    });
 
     // 1) Trusted UIDs
     const trustedUids = await getTrustedUids(db, victimUid);
@@ -166,9 +192,13 @@ app.post("/event", async (req, res) => {
       victimUid,
       lat,
       lon,
-      accuracy: body.accuracy,
-      battery: body.battery,
-      speedKmh: body.speedKmh,
+      accuracy,
+      battery,
+      speedKmh,
+      altitude,
+      heading,
+      address,
+      addressOk,
       mode: body.mode,
       timestamp: ts,
       incident: body.incident,
@@ -177,16 +207,20 @@ app.post("/event", async (req, res) => {
     // 4) Invio FCM
     const results = await sendToTokens(admin, tokens, dataPayload);
 
-    // 5) (Consigliato) salva storico evento
+    // 5) salva storico evento
     await db.collection("events").doc(eventId).set({
       type,
       eventId,
       victimUid,
       lat,
       lon,
-      accuracy: body.accuracy ?? null,
-      battery: body.battery ?? null,
-      speedKmh: body.speedKmh ?? null,
+      accuracy,
+      battery,
+      speedKmh,
+      altitude,
+      heading,
+      address: address || null,
+      addressOk,
       mode: body.mode ?? null,
       timestamp: ts,
       incident: body.incident ?? null,
@@ -211,6 +245,17 @@ app.post("/event", async (req, res) => {
 /* =========================
    Helpers Firestore + FCM
    ========================= */
+
+function normalizeBool(v) {
+  if (v === true || v === false) return v;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true" || s === "1" || s === "yes") return true;
+    if (s === "false" || s === "0" || s === "no") return false;
+  }
+  if (typeof v === "number") return v !== 0;
+  return false;
+}
 
 function toFcmData(obj) {
   // FCM data => SOLO stringhe
